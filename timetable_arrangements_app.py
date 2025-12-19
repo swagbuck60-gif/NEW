@@ -4,12 +4,9 @@ import re
 from collections import defaultdict, Counter
 from io import BytesIO
 
-# If the script and Excel are in the same folder, keep this as is.
-FILE_PATH = "final-school-timetable.xlsx"
-SHEET_TEACHER_WISE = "TEACHER WISE TIMETABLE"
-
 DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT"]
 PERIOD_COLS = ["IST", "2ND", "3RD", "4TH", "5TH", "6TH", "7TH", "8TH"]
+SHEET_TEACHER_WISE = "TEACHER WISE TIMETABLE"
 
 # -----------------------------
 # Helpers to parse class codes
@@ -64,8 +61,8 @@ def stream_for_class(cls: str) -> str:
 # -----------------------------------
 
 @st.cache_data(show_spinner=False)
-def load_teacher_wise():
-    df = pd.read_excel(FILE_PATH, sheet_name=SHEET_TEACHER_WISE, header=None)
+def load_teacher_wise(uploaded_file):
+    df = pd.read_excel(uploaded_file, sheet_name=SHEET_TEACHER_WISE, header=None)
     teacher_tables = {}
     i = 0
     while i < len(df):
@@ -329,65 +326,80 @@ def main():
     st.title("Automatic Daily Arrangement Generator")
 
     st.write(
-        "This app reads the **TEACHER WISE TIMETABLE** from `final-school-timetable.xlsx` "
-        "and automatically generates arrangement teachers for absent staff, "
+        "Upload your **final-school-timetable.xlsx** file and automatically generate arrangement teachers for absent staff, "
         "respecting class bands (VI–VIII / IX–XII) and XI/XII streams."
     )
 
-    teacher_tables = load_teacher_wise()
-    if not teacher_tables:
-        st.error("No teacher data found in TEACHER WISE TIMETABLE sheet.")
-        return
+    # File uploader
+    uploaded_file = st.file_uploader("Upload final-school-timetable.xlsx", type=["xlsx"])
+    
+    if uploaded_file is not None:
+        with st.spinner("Loading teacher timetables..."):
+            teacher_tables = load_teacher_wise(uploaded_file)
+        
+        if not teacher_tables:
+            st.error("❌ No teacher data found in **TEACHER WISE TIMETABLE** sheet.")
+            st.stop()
 
-    schedule, teacher_bands = build_teacher_schedule(teacher_tables)
+        schedule, teacher_bands = build_teacher_schedule(teacher_tables)
+        all_teachers = sorted(teacher_tables.keys())
 
-    all_teachers = sorted(teacher_tables.keys())
+        st.success(f"✅ Loaded timetables for {len(all_teachers)} teachers")
 
-    st.subheader("1. Select day")
-    day = st.selectbox("Day", DAYS)
+        st.subheader("1. Select day")
+        day = st.selectbox("Day", DAYS)
 
-    st.subheader("2. Select absent teachers today")
-    absent_teachers = st.multiselect("Absent teachers", all_teachers)
+        st.subheader("2. Select absent teachers today")
+        absent_teachers = st.multiselect("Absent teachers", all_teachers)
 
-    st.subheader("3. Teachers to exclude from arrangements (busy / duties)")
-    excluded_teachers = st.multiselect(
-        "Exclude these teachers from being used for arrangements:",
-        [t for t in all_teachers if t not in absent_teachers]
-    )
+        st.subheader("3. Teachers to exclude from arrangements (busy / duties)")
+        excluded_teachers = st.multiselect(
+            "Exclude these teachers from being used for arrangements:",
+            [t for t in all_teachers if t not in absent_teachers]
+        )
 
-    st.subheader("4. Arrangement settings")
-    max_arr = st.slider("Maximum arrangements per teacher (today)", 0, 6, 2)
+        st.subheader("4. Arrangement settings")
+        max_arr = st.slider("Maximum arrangements per teacher (today)", 0, 6, 2)
 
-    if st.button("Generate arrangements"):
-        if not absent_teachers:
-            st.warning("Please select at least one absent teacher.")
-        else:
-            df_arr = generate_arrangements(
-                schedule,
-                teacher_bands,
-                day,
-                absent_teachers,
-                excluded_teachers,
-                max_arrangements_per_teacher=max_arr
-            )
-            if df_arr.empty:
-                st.info("No lost periods for the selected absent teachers on this day.")
+        if st.button("🚀 Generate arrangements", type="primary"):
+            if not absent_teachers:
+                st.warning("⚠️ Please select at least one absent teacher.")
             else:
-                st.success("Arrangements generated.")
-                st.dataframe(df_arr)
+                with st.spinner("Generating optimal arrangements..."):
+                    df_arr = generate_arrangements(
+                        schedule,
+                        teacher_bands,
+                        day,
+                        absent_teachers,
+                        excluded_teachers,
+                        max_arrangements_per_teacher=max_arr
+                    )
+                
+                if df_arr.empty:
+                    st.info("ℹ️ No lost periods for the selected absent teachers on this day.")
+                else:
+                    st.success("✅ Arrangements generated successfully!")
+                    st.dataframe(df_arr, use_container_width=True)
 
-                buffer = BytesIO()
-                df_arr.to_excel(buffer, index=False, engine="openpyxl")
-                buffer.seek(0)
-                st.download_button(
-                    "Download arrangements as Excel",
-                    data=buffer,
-                    file_name=f"arrangements_{day}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                    buffer = BytesIO()
+                    df_arr.to_excel(buffer, index=False, engine="openpyxl")
+                    buffer.seek(0)
+                    st.download_button(
+                        label="📥 Download arrangements as Excel",
+                        data=buffer,
+                        file_name=f"arrangements_{day}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
 
-    st.markdown("---")
-    st.caption("Source: TEACHER WISE TIMETABLE sheet in final-school-timetable.xlsx")
+    else:
+        st.info("👆 Please upload your **final-school-timetable.xlsx** file first")
+        st.markdown("""
+        ### 📋 Expected Excel Structure
+        - **Sheet name**: `TEACHER WISE TIMETABLE`
+        - **Teacher names** in column A (before DAY headers)
+        - **Days**: MON, TUE, WED, THU, FRI, SAT
+        - **Periods**: IST, 2ND, 3RD, 4TH, 5TH, 6TH, 7TH, 8TH
+        """)
 
 if __name__ == "__main__":
     main()
