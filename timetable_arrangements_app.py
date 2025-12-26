@@ -4,9 +4,12 @@ import re
 from collections import defaultdict, Counter
 from io import BytesIO
 
+# If the script and Excel are in the same folder, keep this as is.
+FILE_PATH = "final-school-timetable.xlsx"
+SHEET_TEACHER_WISE = "TEACHER WISE TIMETABLE"
+
 DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT"]
 PERIOD_COLS = ["IST", "2ND", "3RD", "4TH", "5TH", "6TH", "7TH", "8TH"]
-SHEET_TEACHER_WISE = "TEACHER WISE TIMETABLE"
 
 # -----------------------------
 # Helpers to parse class codes
@@ -61,8 +64,8 @@ def stream_for_class(cls: str) -> str:
 # -----------------------------------
 
 @st.cache_data(show_spinner=False)
-def load_teacher_wise(uploaded_file):
-    df = pd.read_excel(uploaded_file, sheet_name=SHEET_TEACHER_WISE, header=None)
+def load_teacher_wise():
+    df = pd.read_excel(FILE_PATH, sheet_name=SHEET_TEACHER_WISE, header=None)
     teacher_tables = {}
     i = 0
     while i < len(df):
@@ -229,7 +232,7 @@ def score_candidate_for_slot(tname, band_needed, cls_needed, schedule, teacher_b
     return score
 
 # -----------------------------
-# Arrangement generation
+# Arrangement generation - FINAL FIXED VERSION
 # -----------------------------
 
 def generate_arrangements(
@@ -238,6 +241,7 @@ def generate_arrangements(
     day,
     absent_teachers,
     excluded_teachers,
+    include_teachers=None,
     max_arrangements_per_teacher=2
 ):
     day = day.upper()
@@ -262,59 +266,83 @@ def generate_arrangements(
                     "absent_teacher": t,
                 })
 
-    # 2. For each slot, choose best candidate
+    # 2. NEW: Pre-filter busy teachers (6+ periods on this day)
+    busy_teachers = set()
+    for tname in schedule.keys():
+        if tname in absent_teachers or tname in excluded_teachers:
+            continue
+        day_sched = schedule[tname].get(day, {})
+        busy_periods = sum(1 for col in PERIOD_COLS if day_sched.get(col, ""))
+        if busy_periods >= 6:
+            busy_teachers.add(tname)
+
+    # 3. Process slots by period to prevent double-booking
+    slots_by_period = defaultdict(list)
     for slot in slots:
-        cls_needed = slot["class_code"]
-        band_needed = slot["band"]
-        col = slot["period_col"]
+        slots_by_period[slot["period_col"]].append(slot)
 
-        candidates = []
+    for period_col, period_slots in slots_by_period.items():
+        # For each period, find available teachers FIRST
+        available_teachers = set()
+        
         for tname in schedule.keys():
-            if tname in absent_teachers:
+            if tname in absent_teachers or tname in excluded_teachers or tname in busy_teachers:
                 continue
-            if tname in excluded_teachers:
+            if include_teachers is not None and tname not in include_teachers:
                 continue
-
-            cls_here = schedule[tname].get(day, {}).get(col, "")
+                
+            cls_here = schedule[tname].get(day, {}).get(period_col, "")
             if cls_here:
                 continue
 
             allowed_bands = allowed_band_for_teacher(tname, teacher_bands)
-            if band_needed and band_needed not in allowed_bands:
-                continue
+            # Check if teacher can handle ANY slot in this period
+            can_teach_any = any(
+                slot["band"] == "" or slot["band"] in allowed_bands 
+                for slot in period_slots
+            )
+            if can_teach_any:
+                available_teachers.add(tname)
 
-            sc = score_candidate_for_slot(tname, band_needed, cls_needed, schedule, teacher_bands)
-            candidates.append((tname, sc))
+        # Now assign best teacher to each slot in this period
+        for slot in period_slots:
+            cls_needed = slot["class_code"]
+            band_needed = slot["band"]
 
-        candidates.sort(key=lambda x: (-x[1], arrangement_count[x[0]]))
+            candidates = []
+            for tname in available_teachers:
+                if arrangement_count[tname] >= max_arrangements_per_teacher:
+                    continue
+                    
+                allowed_bands = allowed_band_for_teacher(tname, teacher_bands)
+                if band_needed and band_needed not in allowed_bands:
+                    continue
 
-        assigned = None
-        for tname, sc in candidates:
-            if arrangement_count[tname] >= max_arrangements_per_teacher:
-                continue
-            assigned = (tname, sc)
-            break
+                sc = score_candidate_for_slot(tname, band_needed, cls_needed, schedule, teacher_bands)
+                candidates.append((tname, sc))
 
-        if assigned:
-            tname, sc = assigned
-            arrangement_count[tname] += 1
-            results.append({
-                "Day": day,
-                "Period": col,
-                "Class": cls_needed,
-                "Absent Teacher": slot["absent_teacher"],
-                "Arrangement Teacher": tname,
-                "Score": sc,
-            })
-        else:
-            results.append({
-                "Day": day,
-                "Period": col,
-                "Class": cls_needed,
-                "Absent Teacher": slot["absent_teacher"],
-                "Arrangement Teacher": "NO SUITABLE TEACHER",
-                "Score": 0,
-            })
+            if candidates:
+                candidates.sort(key=lambda x: (-x[1], arrangement_count[x[0]]))
+                tname, sc = candidates[0]
+                arrangement_count[tname] += 1
+                available_teachers.discard(tname)  # Remove from available for this period
+                results.append({
+                    "Day": day,
+                    "Period": period_col,
+                    "Class": cls_needed,
+                    "Absent Teacher": slot["absent_teacher"],
+                    "Arrangement Teacher": tname,
+                    "Score": sc,
+                })
+            else:
+                results.append({
+                    "Day": day,
+                    "Period": period_col,
+                    "Class": cls_needed,
+                    "Absent Teacher": slot["absent_teacher"],
+                    "Arrangement Teacher": "NO SUITABLE TEACHER",
+                    "Score": 0,
+                })
 
     return pd.DataFrame(results)
 
@@ -326,80 +354,78 @@ def main():
     st.title("Automatic Daily Arrangement Generator")
 
     st.write(
-        "Upload your **final-school-timetable.xlsx** file and automatically generate arrangement teachers for absent staff, "
+        "This app reads the **TEACHER WISE TIMETABLE** from `final-school-timetable.xlsx` "
+        "and automatically generates arrangement teachers for absent staff, "
         "respecting class bands (VI–VIII / IX–XII) and XI/XII streams."
     )
 
-    # File uploader
-    uploaded_file = st.file_uploader("Upload final-school-timetable.xlsx", type=["xlsx"])
-    
-    if uploaded_file is not None:
-        with st.spinner("Loading teacher timetables..."):
-            teacher_tables = load_teacher_wise(uploaded_file)
-        
-        if not teacher_tables:
-            st.error("❌ No teacher data found in **TEACHER WISE TIMETABLE** sheet.")
-            st.stop()
+    teacher_tables = load_teacher_wise()
+    if not teacher_tables:
+        st.error("No teacher data found in TEACHER WISE TIMETABLE sheet.")
+        return
 
-        schedule, teacher_bands = build_teacher_schedule(teacher_tables)
-        all_teachers = sorted(teacher_tables.keys())
+    schedule, teacher_bands = build_teacher_schedule(teacher_tables)
 
-        st.success(f"✅ Loaded timetables for {len(all_teachers)} teachers")
+    all_teachers = sorted(teacher_tables.keys())
 
-        st.subheader("1. Select day")
-        day = st.selectbox("Day", DAYS)
+    st.subheader("1. Select day")
+    day = st.selectbox("Day", DAYS)
 
-        st.subheader("2. Select absent teachers today")
-        absent_teachers = st.multiselect("Absent teachers", all_teachers)
+    st.subheader("2. Select absent teachers today")
+    absent_teachers = st.multiselect("Absent teachers", all_teachers)
 
-        st.subheader("3. Teachers to exclude from arrangements (busy / duties)")
-        excluded_teachers = st.multiselect(
-            "Exclude these teachers from being used for arrangements:",
-            [t for t in all_teachers if t not in absent_teachers]
-        )
+    st.subheader("3. Teachers to exclude from arrangements (busy / duties)")
+    excluded_teachers = st.multiselect(
+        "Exclude these teachers from being used for arrangements:",
+        [t for t in all_teachers if t not in absent_teachers]
+    )
 
-        st.subheader("4. Arrangement settings")
+    st.subheader("4. Teachers to include in arrangements (optional)")
+    include_teachers_info = st.info("**Leave empty** to use all available teachers (except absent/excluded). Select specific teachers to **restrict** arrangements to only them.")
+    include_teachers = st.multiselect(
+        "Include only these teachers for arrangements:",
+        [t for t in all_teachers if t not in absent_teachers and t not in excluded_teachers],
+        help="Arrangements will ONLY use teachers from this list. Leave empty for all eligible teachers."
+    )
+
+    st.subheader("5. Arrangement settings")
+    col1, col2 = st.columns(2)
+    with col1:
         max_arr = st.slider("Maximum arrangements per teacher (today)", 0, 6, 2)
+    with col2:
+        st.info("**Teachers with 6+ periods today are automatically excluded**")
 
-        if st.button("🚀 Generate arrangements", type="primary"):
-            if not absent_teachers:
-                st.warning("⚠️ Please select at least one absent teacher.")
+    if st.button("Generate arrangements"):
+        if not absent_teachers:
+            st.warning("Please select at least one absent teacher.")
+        else:
+            df_arr = generate_arrangements(
+                schedule,
+                teacher_bands,
+                day,
+                absent_teachers,
+                excluded_teachers,
+                include_teachers,
+                max_arrangements_per_teacher=max_arr
+            )
+            if df_arr.empty:
+                st.info("No lost periods for the selected absent teachers on this day.")
             else:
-                with st.spinner("Generating optimal arrangements..."):
-                    df_arr = generate_arrangements(
-                        schedule,
-                        teacher_bands,
-                        day,
-                        absent_teachers,
-                        excluded_teachers,
-                        max_arrangements_per_teacher=max_arr
-                    )
-                
-                if df_arr.empty:
-                    st.info("ℹ️ No lost periods for the selected absent teachers on this day.")
-                else:
-                    st.success("✅ Arrangements generated successfully!")
-                    st.dataframe(df_arr, use_container_width=True)
+                st.success("✅ Arrangements generated - No double-booking, no overburdening!")
+                st.dataframe(df_arr)
 
-                    buffer = BytesIO()
-                    df_arr.to_excel(buffer, index=False, engine="openpyxl")
-                    buffer.seek(0)
-                    st.download_button(
-                        label="📥 Download arrangements as Excel",
-                        data=buffer,
-                        file_name=f"arrangements_{day}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                buffer = BytesIO()
+                df_arr.to_excel(buffer, index=False, engine="openpyxl")
+                buffer.seek(0)
+                st.download_button(
+                    "📥 Download arrangements as Excel",
+                    data=buffer,
+                    file_name=f"arrangements_{day}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
 
-    else:
-        st.info("👆 Please upload your **final-school-timetable.xlsx** file first")
-        st.markdown("""
-        ### 📋 Expected Excel Structure
-        - **Sheet name**: `TEACHER WISE TIMETABLE`
-        - **Teacher names** in column A (before DAY headers)
-        - **Days**: MON, TUE, WED, THU, FRI, SAT
-        - **Periods**: IST, 2ND, 3RD, 4TH, 5TH, 6TH, 7TH, 8TH
-        """)
+    st.markdown("---")
+    st.caption("✅ **Fixed**: No double-booking per period + Teachers with 6+ periods auto-excluded")
 
 if __name__ == "__main__":
     main()
